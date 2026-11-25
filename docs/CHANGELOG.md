@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Nonlinear response history analysis (NRHA) of the BNSM models, `do_nrha`, available in all models (CP01–CP03, DP01–DP05):
+  - One or two horizontal ground motion components (`acc_x`, `acc_y`), in g or m/s2, with a scale factor and optional free vibration after the record.
+  - Rayleigh damping matched at the periods of two modes (by default modes 1 and 3, 5%). The stiffness-proportional part uses the committed stiffness by default and is not assigned to the rigid joint links (CP03).
+  - HHT integration (alpha = 0.9) by default, which suppresses spurious high-frequency floor accelerations from stiff undamped elements such as the infill struts.
+  - Steps that do not converge are retried with alternative algorithms, substeps and, as a last resort, relaxed tolerances (counted in the results). The analysis stops at a collapse drift (by default 10%).
+  - Results include the peak and residual inter-storey drifts (maximum over the column lines, so torsion is included, measured from the post-gravity state), peak floor displacements, peak absolute floor accelerations (ground in row 0), peak base shear and, optionally, response histories. Peak drifts and accelerations have the shapes used by OQ-VMTK.
+- Example script `scripts/run_nrha.py`.
+
+### Changed
+
+- The eigenvalue solution of `do_modal` is moved to `_solve_eigen`, shared with `do_nrha`.
+
 ## [1.2.2] - 2026-11-06
 
 ### Changed

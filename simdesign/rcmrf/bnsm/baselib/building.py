@@ -5,7 +5,8 @@ representations.
 # Imports from installed packages
 from abc import ABC
 import numpy as np
-from typing import Optional, List, Dict, Literal, Tuple, Type
+from typing import (Any, Optional, List, Dict, Literal, Sequence, Tuple,
+                    Type)
 import openseespy.opensees as ops
 from pathlib import Path
 
@@ -13,6 +14,8 @@ from pathlib import Path
 from .constants import (RIGID_MAT, BIG_VALUE, GRAV_TS_TAG, GRAV_P_TAG,
                         NSPA_TS_TAG, NSPA_P_TAG, NSPA_EQUILIBRIUM_TOL,
                         NSPA_MAX_STIFFNESS_RATIO,
+                        NRHA_TS_TAG, NRHA_DAMPING_REGION_TAG,
+                        NRHA_SUBSTEPS, NRHA_TOL_FACTORS,
                         MIN_EIGEN_MODES,
                         MIN_EIGEN_VALUE)
 from .foundation import FoundationBase
@@ -27,6 +30,7 @@ from ...bdim.baselib.building import BuildingBase as BuildingDesign
 
 # Imports from utils library
 from ....utils.misc import make_dir, PRECISION
+from ....utils.units import grav_acc
 from ....utils import plotter as pl
 from ....utils.tags import sub_tag
 
@@ -624,26 +628,8 @@ class BuildingBase(ABC):
         # Build the model
         self.build()
 
-        # Perform eigen value analysis, with at least MIN_EIGEN_MODES modes
-        num_solve = max(num_modes, MIN_EIGEN_MODES)
-        list_solvers = ['-genBandArpack', '-fullGenLapack', '-symmBandLapack']
-        ok = False
-        for s in list_solvers:
-            try:
-                eigen_values = ops.eigen(s, num_solve)
-                # All the eigenvalues must be set (not tiny) and finite
-                ok = all(MIN_EIGEN_VALUE < value < 1e+300
-                         for value in eigen_values)
-                if ok:
-                    break
-            except BaseException as e:
-                print(f"Using {s[1:]} as solver... received an error: {e}")
-        if not ok:
-            raise RuntimeError(
-                "Could not complete the eigenvalue analysis, "
-                + "something is wrong...\n"
-                + "Try to reduce number of modes to determine..."
-            )
+        # Perform eigen value analysis
+        self._solve_eigen(num_modes)
 
         # Save eigen vectors for retained floor nodes
         if out_dir:
@@ -685,6 +671,496 @@ class BuildingBase(ABC):
                 modal_properties[key] = values[:num_modes]
 
         return modal_properties
+
+    @staticmethod
+    def _solve_eigen(num_modes: int) -> List[float]:
+        """Solves the eigenvalue problem of the model in the OpenSees domain.
+
+        At least ``MIN_EIGEN_MODES`` modes are solved for, because the
+        default ARPACK solver may not converge for a single eigenvalue. The
+        solvers are tried in turn until all eigenvalues are valid.
+
+        Parameters
+        ----------
+        num_modes : int
+            Number of modes required.
+
+        Returns
+        -------
+        List[float]
+            Eigenvalues (rad^2/s^2) of all solved modes, in ascending order.
+
+        Raises
+        ------
+        RuntimeError
+            If none of the solvers gives valid eigenvalues.
+        """
+        num_solve = max(num_modes, MIN_EIGEN_MODES)
+        list_solvers = ['-genBandArpack', '-fullGenLapack', '-symmBandLapack']
+        for s in list_solvers:
+            try:
+                eigen_values = ops.eigen(s, num_solve)
+                # All the eigenvalues must be set (not tiny) and finite
+                if all(MIN_EIGEN_VALUE < value < 1e+300
+                       for value in eigen_values):
+                    return list(eigen_values)
+            except BaseException as e:
+                print(f"Using {s[1:]} as solver... received an error: {e}")
+        raise RuntimeError(
+            "Could not complete the eigenvalue analysis, "
+            + "something is wrong...\n"
+            + "Try to reduce number of modes to determine..."
+        )
+
+    def do_nrha(
+        self,
+        acc_x: Optional[Sequence[float] | np.ndarray] = None,
+        acc_y: Optional[Sequence[float] | np.ndarray] = None,
+        dt: Optional[float] = None,
+        scale_factor: float = 1.0,
+        acc_units: Literal['g', 'm/s2'] = 'g',
+        damping_ratio: float = 0.05,
+        damping_modes: Tuple[int, int] = (1, 3),
+        damping_stiffness: Literal[
+            'initial', 'committed', 'current'] = 'committed',
+        dt_analysis: Optional[float] = None,
+        free_vibration: float = 0.0,
+        collapse_drift: float = 0.10,
+        integrator: Sequence[str | float] = ('HHT', 0.9),
+        tol: float = 1.0e-6,
+        max_iter: int = 50,
+        out_dir: Optional[str | Path] = None,
+        save_histories: bool = False,
+    ) -> Dict[str, Any]:
+        """Performs nonlinear response history analysis (NRHA) under one
+        or two horizontal ground motion components.
+
+        Parameters
+        ----------
+        acc_x : Sequence[float] | np.ndarray, optional
+            Ground acceleration history applied in the X direction.
+            By default None (no X excitation).
+        acc_y : Sequence[float] | np.ndarray, optional
+            Ground acceleration history applied in the Y direction.
+            By default None (no Y excitation). At least one of `acc_x` and
+            `acc_y` must be given. If both are given, they must have the same
+            time step and are applied simultaneously.
+        dt : float
+            Time step of the ground acceleration histories (s).
+        scale_factor : float, optional
+            Factor applied to the ground acceleration histories.
+            By default 1.0.
+        acc_units : Literal['g', 'm/s2'], optional
+            Units of the ground acceleration histories. By default 'g'.
+        damping_ratio : float, optional
+            Rayleigh damping ratio assigned to the two `damping_modes`.
+            By default 0.05.
+        damping_modes : Tuple[int, int], optional
+            Modes (1-based) at whose periods the damping ratio is matched.
+            By default (1, 3), i.e., in a regular building, the fundamental
+            mode and, approximately, the mode of the other direction or the
+            first torsional mode.
+        damping_stiffness : Literal['initial', 'committed', 'current']
+            Stiffness matrix used in the stiffness-proportional part of the
+            Rayleigh damping. By default 'committed' (the tangent stiffness
+            of the last committed step), which avoids the spurious damping
+            forces of initial stiffness damping in yielding elements.
+        dt_analysis : float, optional
+            Integration time step (s). If None, `dt` is used. Steps that do
+            not converge are subdivided automatically. By default None.
+        free_vibration : float, optional
+            Duration (s) of free vibration analysed after the end of the
+            ground motion, e.g., to estimate residual drifts. By default 0.0.
+        collapse_drift : float, optional
+            Inter-storey drift ratio taken as collapse. The analysis stops
+            when it is reached in any storey. By default 0.10.
+        integrator : Sequence[str | float], optional
+            Arguments of the OpenSees transient integrator command. By
+            default ('HHT', 0.9), the Hilber-Hughes-Taylor method with
+            alpha = 0.9, whose numerical dissipation suppresses the spurious
+            high-frequency oscillations of the floor accelerations caused by
+            stiff undamped elements (e.g., infill struts). Use
+            ('Newmark', 0.5, 0.25) for the average acceleration method,
+            which has no numerical dissipation.
+        tol : float, optional
+            Convergence tolerance of the displacement increment norm.
+            By default 1.0e-6.
+        max_iter : int, optional
+            Maximum number of iterations per step. By default 50.
+        out_dir : str | Path, optional
+            Directory to save the results. If None, no output is saved.
+            By default None.
+        save_histories : bool, optional
+            If True, response histories are included in the results (and
+            saved to `out_dir`). By default False.
+
+        Returns
+        -------
+        Dict[str, Any]
+            Results of the analysis. Arrays with two columns contain the X
+            (column 0) and Y (column 1) components. Storeys are numbered from
+            the ground storey.
+
+            - ``ok`` (int): 0 if the analysis reached the end of the record
+              (plus free vibration) or the collapse drift. Negative if it
+              stopped earlier because a step did not converge.
+            - ``collapse`` (bool): True if the collapse drift was reached.
+            - ``time`` (float): Time (s) reached by the analysis.
+            - ``duration`` (float): Time (s) to be analysed, i.e., record
+              duration plus free vibration.
+            - ``periods`` (List[float]): Periods (s) of the damping modes.
+            - ``rayleigh`` (Tuple[float, float]): Mass and stiffness
+              proportional Rayleigh damping coefficients.
+            - ``storey_heights`` (np.ndarray): Storey heights (m), shape
+              (n_storeys,).
+            - ``peak_drift`` (np.ndarray): Peak inter-storey drift ratios,
+              the maximum over all column lines of each storey, shape
+              (n_storeys, 2).
+            - ``residual_drift`` (np.ndarray): Absolute inter-storey drift
+              ratios at the end of the analysis (maximum over the column
+              lines), shape (n_storeys, 2). Meaningful only with enough
+              free vibration.
+            - ``peak_disp`` (np.ndarray): Peak floor displacements (m) at the
+              centres of mass, relative to the ground, shape (n_storeys, 2).
+            - ``peak_accel`` (np.ndarray): Peak absolute floor accelerations
+              (g) at the centres of mass, shape (n_storeys + 1, 2). Row 0 is
+              the ground (peak ground acceleration).
+            - ``peak_base_shear`` (np.ndarray): Peak base shear (kN), shape
+              (2,).
+            - ``max_peak_drift`` (float): Maximum of ``peak_drift``.
+            - ``max_peak_drift_dir`` (str): Direction ('X' or 'Y') of
+              ``max_peak_drift``.
+            - ``max_peak_drift_loc`` (int): Storey (1-based) of
+              ``max_peak_drift``.
+            - ``max_peak_accel`` (float): Maximum of ``peak_accel``.
+            - ``num_relaxed_steps`` (int): Number of steps accepted with a
+              relaxed convergence tolerance.
+            - ``histories`` (Dict[str, np.ndarray]): Only if
+              `save_histories` is True. ``time`` (n_steps,), ``ground_accel``
+              (g) (n_steps, 2), ``floor_disp`` (m) (n_steps, n_storeys, 2),
+              ``floor_accel`` (g, absolute) (n_steps, n_storeys, 2),
+              ``drift`` (n_steps, n_storeys, 2) as the maximum absolute
+              drift over the column lines, and ``base_shear`` (kN)
+              (n_steps, 2). Step 0 is the state after the gravity analysis.
+
+        Raises
+        ------
+        ValueError
+            If the inputs are invalid.
+
+        Notes
+        -----
+        - The gravity loads are applied before the ground motion, and the
+          infills, if included, are added after the gravity analysis.
+        - Rayleigh damping is defined from the periods of `damping_modes`
+          of the model under gravity loads. The mass-proportional part is
+          assigned to all nodes, the stiffness-proportional part to all
+          elements except the rigid links of the joints (e.g., CP03), which
+          would otherwise produce large spurious damping forces. Elements
+          defined without Rayleigh damping in OpenSees by default (e.g.,
+          zero-length elements and the infill trusses) stay undamped.
+        - Drifts are computed for every column line from the displacements
+          of the floor nodes at the same plan location in consecutive floors
+          (the foundation nodes for the ground storey). The peak drift of a
+          storey is the maximum over its column lines, so that the torsional
+          response is included.
+        - Drifts and floor displacements are measured from the state after
+          the gravity analysis, i.e., the lateral sway under gravity loads
+          is excluded.
+        - A step that does not converge is retried with alternative
+          solution algorithms, with smaller substeps and, as a last resort,
+          with relaxed tolerances (see ``NRHA_SUBSTEPS`` and
+          ``NRHA_TOL_FACTORS``). The analysis stops, with ``ok`` negative,
+          if the step still does not converge. Such non-convergence often
+          indicates a collapse mechanism; check ``max_peak_drift``.
+        """
+        # Check the inputs
+        records = {}
+        for dof, acc in ((1, acc_x), (2, acc_y)):
+            if acc is None:
+                continue
+            acc = np.asarray(acc, dtype=float).ravel()
+            if acc.size < 2 or not np.all(np.isfinite(acc)):
+                raise ValueError(
+                    "Ground acceleration histories must contain at least two "
+                    "finite values.")
+            records[dof] = acc
+        if not records:
+            raise ValueError("At least one of acc_x and acc_y must be given.")
+        if dt is None or not dt > 0:
+            raise ValueError("dt must be a positive number.")
+        if acc_units not in ('g', 'm/s2'):
+            raise ValueError("acc_units must be 'g' or 'm/s2'.")
+        if not 0.0 <= damping_ratio < 1.0:
+            raise ValueError("damping_ratio must be in [0, 1).")
+        if (len(damping_modes) != 2 or any(int(m) != m or m < 1
+                                           for m in damping_modes)
+                or damping_modes[0] == damping_modes[1]):
+            raise ValueError(
+                "damping_modes must be two distinct mode numbers (>= 1).")
+        if damping_stiffness not in ('initial', 'committed', 'current'):
+            raise ValueError(
+                "damping_stiffness must be 'initial', 'committed' or "
+                "'current'.")
+        dt_analysis = dt if dt_analysis is None else dt_analysis
+        if not dt_analysis > 0:
+            raise ValueError("dt_analysis must be a positive number.")
+        if free_vibration < 0:
+            raise ValueError("free_vibration must not be negative.")
+        if not collapse_drift > 0:
+            raise ValueError("collapse_drift must be a positive number.")
+
+        # Build the model and apply the gravity loads
+        self.build()
+
+        # Rayleigh damping from the periods of the damping modes
+        eigen_values = self._solve_eigen(max(damping_modes))
+        omegas = [np.sqrt(eigen_values[m - 1]) for m in damping_modes]
+        periods = [2 * np.pi / omega for omega in omegas]
+        alpha_m = damping_ratio * 2 * omegas[0] * omegas[1] / sum(omegas)
+        beta_k = damping_ratio * 2 / sum(omegas)
+        rigid = set()
+        for joint in self.floor_joints + self.stairs_joints:
+            rigid.update(getattr(joint, 'rigid_ele', []))
+        damped = [tag for tag in ops.getEleTags() if tag not in rigid]
+        betas = {
+            'current': [beta_k, 0.0, 0.0],
+            'initial': [0.0, beta_k, 0.0],
+            'committed': [0.0, 0.0, beta_k],
+        }[damping_stiffness]
+        ops.rayleigh(alpha_m, 0.0, 0.0, 0.0)
+        if damped and beta_k > 0:
+            ops.region(NRHA_DAMPING_REGION_TAG, '-eleOnly', *damped,
+                       '-rayleigh', 0.0, *betas)
+
+        # Add the ground motion components
+        factor = scale_factor * (grav_acc if acc_units == 'g' else 1.0)
+        for dof, acc in records.items():
+            tag = NRHA_TS_TAG + dof
+            ops.timeSeries('Path', tag, '-dt', dt, '-values', *acc.tolist(),
+                           '-factor', factor)
+            ops.pattern('UniformExcitation', tag, dof, '-accel', tag)
+        duration = max(acc.size - 1 for acc in records.values()) * dt
+        duration += free_vibration
+        rec_time = {dof: np.arange(acc.size) * dt
+                    for dof, acc in records.items()}
+
+        def ground_accel(time: float) -> np.ndarray:
+            """Ground acceleration (m/s2) in X and Y at the given time."""
+            values = np.zeros(2)
+            for dof, acc in records.items():
+                values[dof - 1] = factor * np.interp(
+                    time, rec_time[dof], acc, left=0.0, right=0.0)
+            return values
+
+        # Floor nodes, column lines and storey heights
+        supports = [found.foundation_node for found in self.foundations]
+        floors = sorted(self.floors, key=lambda f: f.rnode.coordinates[2])
+        rnodes = [floor.rnode.tag for floor in floors]
+        base_level = min(node.coordinates[2] for node in supports)
+        storey_heights = np.diff(
+            [base_level] + [floor.rnode.coordinates[2] for floor in floors])
+        levels = [supports] + [floor.cnodes for floor in floors]
+        lines = []  # (storey index, bottom node, top node, height)
+        for i in range(1, len(levels)):
+            below = {(round(n.coordinates[0], PRECISION),
+                      round(n.coordinates[1], PRECISION)): n
+                     for n in levels[i - 1]}
+            for top in levels[i]:
+                key = (round(top.coordinates[0], PRECISION),
+                       round(top.coordinates[1], PRECISION))
+                bottom = below.get(key)
+                if bottom is not None:
+                    height = top.coordinates[2] - bottom.coordinates[2]
+                    lines.append((i - 1, bottom.tag, top.tag, height))
+        line_storeys = np.array([line[0] for line in lines], dtype=int)
+        line_bottoms = [line[1] for line in lines]
+        line_tops = [line[2] for line in lines]
+        line_heights = np.array([line[3] for line in lines])
+        line_nodes = sorted(set(line_bottoms + line_tops))
+        support_tags = [node.tag for node in supports]
+        num_storeys = len(floors)
+        # Displacements under gravity loads, the reference for the response
+        u_line_grav = np.array([ops.nodeDisp(tag)[:2]
+                                for tag in line_tops]) - np.array(
+            [ops.nodeDisp(tag)[:2] for tag in line_bottoms])
+        u_floor_grav = np.array([ops.nodeDisp(tag)[:2] for tag in rnodes])
+
+        def response(time: float) -> Tuple[np.ndarray, ...]:
+            """Current drifts, floor displacements, absolute floor
+            accelerations (m/s2), ground acceleration (m/s2) and base
+            shear."""
+            disps = {tag: ops.nodeDisp(tag) for tag in line_nodes}
+            u_bot = np.array([disps[tag][:2] for tag in line_bottoms])
+            u_top = np.array([disps[tag][:2] for tag in line_tops])
+            line_drifts = np.abs(
+                u_top - u_bot - u_line_grav) / line_heights[:, None]
+            drift = np.zeros((num_storeys, 2))
+            np.maximum.at(drift, line_storeys, line_drifts)
+            ag = ground_accel(time)
+            floor_disp = np.array([ops.nodeDisp(tag)[:2]
+                                   for tag in rnodes]) - u_floor_grav
+            floor_accel = np.array(
+                [ops.nodeAccel(tag)[:2] for tag in rnodes]) + ag
+            ops.reactions()
+            shear = -np.sum([ops.nodeReaction(tag)[:2]
+                             for tag in support_tags], axis=0)
+            return drift, floor_disp, floor_accel, ag, shear
+
+        # Output directory is provided, save the log without any echo
+        if out_dir:
+            out_dir = Path(out_dir)
+            if not Path.exists(out_dir):
+                make_dir(out_dir)
+            ops.logFile(str(out_dir / 'log_nrha.out'), '-noEcho')
+
+        # Analysis objects
+        ops.wipeAnalysis()
+        ops.constraints('Transformation')
+        ops.numberer('RCM')
+        ops.system('UmfPack')
+        ops.test('NormDispIncr', tol, max_iter)
+        ops.algorithm('Newton')
+        ops.integrator(*integrator)
+        ops.analysis('Transient')
+
+        # Initial state (after gravity)
+        drift, floor_disp, floor_accel, ag, shear = response(0.0)
+        peak_drift = drift.copy()
+        peak_disp = np.abs(floor_disp)
+        peak_accel = np.vstack([np.abs(ag), np.abs(floor_accel)])
+        peak_shear = np.abs(shear)
+        hist = {'time': [0.0], 'ground_accel': [ag],
+                'floor_disp': [floor_disp], 'floor_accel': [floor_accel],
+                'drift': [drift], 'base_shear': [shear]}
+
+        # Perform the analysis
+        ok = 0
+        collapse = False
+        num_relaxed = 0
+        time = ops.getTime()
+        while time < duration - 1e-9 * dt_analysis:
+            step = min(dt_analysis, duration - time)
+            ok, relaxed = self._do_nrha_step(step, tol, max_iter)
+            num_relaxed += relaxed
+            if ok != 0:
+                break
+            time = ops.getTime()
+            drift, floor_disp, floor_accel, ag, shear = response(time)
+            np.maximum(peak_drift, drift, out=peak_drift)
+            np.maximum(peak_disp, np.abs(floor_disp), out=peak_disp)
+            np.maximum(peak_accel, np.vstack(
+                [np.abs(ag), np.abs(floor_accel)]), out=peak_accel)
+            np.maximum(peak_shear, np.abs(shear), out=peak_shear)
+            if save_histories:
+                for key, value in zip(
+                        hist, (time, ag, floor_disp, floor_accel, drift,
+                               shear)):
+                    hist[key].append(value)
+            if drift.max() >= collapse_drift:
+                collapse = True
+                break
+
+        # Collect the results
+        loc, direction = np.unravel_index(
+            np.argmax(peak_drift), peak_drift.shape)
+        results = {
+            'ok': ok,
+            'collapse': collapse,
+            'time': time,
+            'duration': duration,
+            'periods': periods,
+            'rayleigh': (alpha_m, beta_k),
+            'storey_heights': storey_heights,
+            'peak_drift': peak_drift,
+            'residual_drift': drift,
+            'peak_disp': peak_disp,
+            'peak_accel': peak_accel / grav_acc,
+            'peak_base_shear': peak_shear,
+            'max_peak_drift': float(peak_drift.max()),
+            'max_peak_drift_dir': 'XY'[direction],
+            'max_peak_drift_loc': int(loc) + 1,
+            'max_peak_accel': float(peak_accel.max() / grav_acc),
+            'num_relaxed_steps': num_relaxed,
+        }
+        if save_histories:
+            histories = {key: np.array(value) for key, value in hist.items()}
+            histories['ground_accel'] /= grav_acc
+            histories['floor_accel'] /= grav_acc
+            results['histories'] = histories
+
+        if out_dir:  # Output directory is provided, save stuff
+            for key in ('storey_heights', 'peak_drift', 'residual_drift',
+                        'peak_disp', 'peak_accel', 'peak_base_shear'):
+                np.savetxt(out_dir / f'{key}.out', np.atleast_1d(
+                    results[key]), delimiter=' ', fmt="%.8f")
+            if save_histories:
+                for key, value in results['histories'].items():
+                    if value.ndim == 3:  # Save X and Y components separately
+                        for i, d in enumerate('xy'):
+                            np.savetxt(out_dir / f'{key}_{d}.out',
+                                       value[:, :, i], delimiter=' ',
+                                       fmt="%.8f")
+                    else:
+                        np.savetxt(out_dir / f'{key}.out', value,
+                                   delimiter=' ', fmt="%.8f")
+
+        # Wipe the numerical model
+        ops.wipe()
+        return results
+
+    @staticmethod
+    def _do_nrha_step(
+        dt: float, tol: float, max_iter: int
+    ) -> Tuple[int, bool]:
+        """Advances the nrha by one time step, with alternative solution
+        algorithms, substeps and relaxed tolerances for steps that do not
+        converge.
+
+        Parameters
+        ----------
+        dt : float
+            Time step (s).
+        tol : float
+            Convergence tolerance.
+        max_iter : int
+            Maximum number of iterations per step.
+
+        Returns
+        -------
+        ok : int
+            0 if the step converged, negative otherwise.
+        relaxed : bool
+            True if the step converged only with a relaxed tolerance.
+        """
+        algorithms = [
+            ('Newton',),
+            ('KrylovNewton',),
+            ('NewtonLineSearch', '-InitialInterpolated', 0.8),
+            ('ModifiedNewton', '-initial'),
+            ('BFGS',),
+        ]
+        t_target = ops.getTime() + dt
+        ok = -1
+        for tol_factor in NRHA_TOL_FACTORS:
+            for num_substeps in NRHA_SUBSTEPS:
+                substep = dt / num_substeps
+                while ops.getTime() < t_target - 1e-9 * dt:
+                    h = min(substep, t_target - ops.getTime())
+                    for algorithm in algorithms:
+                        ops.test('NormDispIncr', tol * tol_factor, max_iter)
+                        ops.algorithm(*algorithm)
+                        ok = ops.analyze(1, h)
+                        if ok == 0:
+                            break
+                    if ok != 0:
+                        break
+                if ok == 0:
+                    # Restore the default solution settings
+                    ops.test('NormDispIncr', tol, max_iter)
+                    ops.algorithm('Newton')
+                    return 0, tol_factor > 1.0
+        return ok, False
 
     def do_nspa(
         self, ctrl_dof: Literal[1, 2],

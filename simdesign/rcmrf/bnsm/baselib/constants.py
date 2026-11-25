@@ -38,6 +38,20 @@ and nspa loads."""
 NSPA_P_TAG = 2
 """Tag for load pattern which associates nspa time-series with the
 nspa point loads."""
+NRHA_TS_TAG = 10
+"""Base tag for the time-series and uniform excitation patterns of the
+ground motion components in nrha. The tag of a component is this value plus
+its direction (1: X, 2: Y)."""
+NRHA_DAMPING_REGION_TAG = 1
+"""Tag for the region of elements with stiffness-proportional Rayleigh
+damping in nrha."""
+NRHA_SUBSTEPS = (1, 2, 5, 10, 20)
+"""Numbers of substeps tried, in order, for an nrha step that does not
+converge with any of the solution algorithms."""
+NRHA_TOL_FACTORS = (1.0, 10.0, 100.0)
+"""Factors applied, in order, to the convergence tolerance of an nrha step
+that does not converge with any number of substeps. Steps accepted with a
+factor above 1 are counted in the results."""
 NSPA_EQUILIBRIUM_TOL = 0.01
 """Largest relative difference between the base shear (sum of the support
 reactions) and the applied lateral load accepted in a pushover step."""
