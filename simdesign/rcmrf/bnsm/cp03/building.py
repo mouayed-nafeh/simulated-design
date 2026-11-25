@@ -186,6 +186,7 @@ class Building(BuildingBase):
         self.beams = []
         self.columns = []
         self.infills = []
+        self.storey_curves = {}
         self._set_basic_masses()
         self._initialize_floor_joints()
         self._initialize_stairs_joints()

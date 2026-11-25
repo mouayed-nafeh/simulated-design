@@ -16,6 +16,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Steps that do not converge are retried with alternative algorithms, substeps and, as a last resort, relaxed tolerances (counted in the results). The analysis stops at a collapse drift (by default 10%).
   - Results include the peak and residual inter-storey drifts (maximum over the column lines, so torsion is included, measured from the post-gravity state), peak floor displacements, peak absolute floor accelerations (ground in row 0), peak base shear and, optionally, response histories. Peak drifts and accelerations have the shapes used by OQ-VMTK.
 - Example script `scripts/run_nrha.py`.
+- Storey-level pushover output: `do_nspa` stores the storey drifts (at the centres of mass, from the post-gravity state) and storey shears (applied lateral loads at and above each floor) of every recorded step in `storey_curves['x' | 'y']`, together with the storey heights and floor masses, and saves them to `storey_drifts_{x|y}.out` and `storey_shears_{x|y}.out`. The return value of `do_nspa` is unchanged.
 
 ### Changed
 

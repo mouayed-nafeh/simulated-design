@@ -112,6 +112,9 @@ class BuildingBase(ABC):
         How the beam gravity loads are applied: 'uniform' element loads,
         'point' loads at the beam element ends, or 'auto' ('point' if the
         beam-column joints are inelastic, 'uniform' otherwise).
+    storey_curves : Dict[Literal['x', 'y'], Dict[str, Any]]
+        Storey-level response (storey drifts and shears) of the last
+        pushover analysis in each direction. See ``do_nspa``.
     """
     design: BuildingDesign
     foundations: List[FoundationBase]
@@ -139,6 +142,7 @@ class BuildingBase(ABC):
     cracked_beam: Optional[bool | float]
     cracked_column: Optional[bool | float]
     beam_loads: Literal['auto', 'uniform', 'point']
+    storey_curves: Dict[Literal['x', 'y'], Dict[str, Any]]
 
     def __init__(
         self, design: BuildingDesign,
@@ -227,6 +231,7 @@ class BuildingBase(ABC):
         self.beams = []
         self.columns = []
         self.infills = []
+        self.storey_curves = {}
         self._set_basic_masses()
         self._initialize_floor_joints()
         self._initialize_stairs_joints()
@@ -1205,6 +1210,27 @@ class BuildingBase(ABC):
         or if the base shear reaches 1.5 times the seismic weight. The
         exported ``nspa.py`` and ``nspa.tcl`` do not include the
         equilibrium and stiffness checks.
+
+        The storey-level response of the recorded steps is stored in
+        ``storey_curves['x']`` or ``storey_curves['y']``, a dictionary with:
+
+        - ``storey_heights`` (np.ndarray): Storey heights (m), shape
+          (n_storeys,), from the ground storey up.
+        - ``floor_masses`` (np.ndarray): Floor masses (tonnes), shape
+          (n_storeys,).
+        - ``floor_disp`` (np.ndarray): Floor displacements (m) at the centres
+          of mass, relative to the state after the gravity analysis, shape
+          (n_steps, n_storeys).
+        - ``storey_drift`` (np.ndarray): Inter-storey drift ratios at the
+          centres of mass, shape (n_steps, n_storeys).
+        - ``storey_shear`` (np.ndarray): Storey shears (kN), i.e., the sum of
+          the lateral loads applied at and above each floor, shape
+          (n_steps, n_storeys). The ground storey shear is the base shear.
+        - ``ctrl_disp``, ``base_shear`` and ``ok``: as returned.
+
+        Drifts and shears are positive in the loading direction. With
+        `out_dir`, they are also saved to ``storey_drifts_{x|y}.out`` and
+        ``storey_shears_{x|y}.out``.
         """
         # Analysis direction
         direction = 'x' if ctrl_dof == 1 else 'y'
@@ -1239,6 +1265,15 @@ class BuildingBase(ABC):
         base_level = min([ops.nodeCoord(node, 3) for node in supports])
         storey_heights = [round(ops.nodeCoord(node, 3) - base_level,
                                 PRECISION) for node in floors]
+
+        # Floor displacements under gravity loads, the reference for the
+        # storey drifts, and the floor order from the ground up
+        floor_disp_grav = np.array(
+            [ops.nodeDisp(node, ctrl_dof) for node in floors])
+        floor_order = np.argsort(storey_heights, kind='stable')
+        floor_loads = np.array(
+            [values[ctrl_dof - 1] for values in loads])[floor_order]
+        load_factors = [0.0]
 
         # Output directory is provided, save stuff
         if out_dir:
@@ -1376,17 +1411,46 @@ class BuildingBase(ABC):
                     [ops.nodeDisp(node, ctrl_dof) for node in floors]
                 )
                 support_reactions.append(current_reactions)
+                load_factors.append(ops.getLoadFactor(NSPA_P_TAG))
             elif (
                 max(base_shear) == 0.0  # Analysis did not even start
                 or base_shear[-1] / max(base_shear) > 0.8  # Not good enough
             ):
                 ok = -1
 
+        # Storey-level response, from the ground storey up
+        floor_disp = np.array(storey_displacements, dtype=float)
+        floor_disp[1:] -= floor_disp_grav  # Step 0 is the gravity state
+        floor_disp = floor_disp[:, floor_order]
+        elevations = np.array(storey_heights)[floor_order]
+        heights = np.diff(np.concatenate([[0.0], elevations]))
+        storey_drift = np.diff(
+            np.hstack([np.zeros((len(floor_disp), 1)), floor_disp]),
+            axis=1) / heights
+        # Storey shear: the applied lateral loads at and above each floor
+        storey_shear = np.outer(
+            load_factors, np.cumsum(floor_loads[::-1])[::-1])
+        self.storey_curves[direction] = {
+            'storey_heights': heights,
+            'floor_masses': np.array(
+                [sum(self.floors[i].masses) for i in floor_order]),
+            'floor_disp': floor_disp,
+            'storey_drift': storey_drift,
+            'storey_shear': storey_shear,
+            'ctrl_disp': np.array(ctrl_disp),
+            'base_shear': np.array(base_shear),
+            'ok': ok,
+        }
+
         if out_dir:  # Output directory is provided, save stuff
             np.savetxt(out_dir / f'ctrl_disp_{direction}.out',
                        ctrl_disp, delimiter=' ', fmt="%.8f")
             np.savetxt(out_dir / f'base_shear_{direction}.out',
                        base_shear, delimiter=' ', fmt="%.8f")
+            np.savetxt(out_dir / f'storey_drifts_{direction}.out',
+                       storey_drift, delimiter=' ', fmt="%.8f")
+            np.savetxt(out_dir / f'storey_shears_{direction}.out',
+                       storey_shear, delimiter=' ', fmt="%.8f")
             if not use_recorder:  # Recorders are not used
                 np.savetxt(out_dir / f'storey_displacements_{direction}.out',
                            storey_displacements, delimiter=' ', fmt="%.8f")
